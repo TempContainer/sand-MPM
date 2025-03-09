@@ -136,7 +136,7 @@ def project(sig, p):
     return res_m, res_n
 
 @ti.kernel
-def calculate_CDF1():
+def calculate_CDF():
     for i, j in grid_A:
         for k in ti.static(range(n_rigid)):
             grid_A[i, j][k] = 0
@@ -164,8 +164,6 @@ def calculate_CDF1():
                     cross = pa[0] * ba[1] - pa[1] * ba[0]
                     grid_T[temp][k] = 1 if cross > 0.0 else -1
 
-@ti.kernel
-def calculate_CDF2():
     for i, j in grid_r:
         d_min = 1e7
         for k in ti.static(range(n_rigid)):
@@ -433,8 +431,7 @@ def initialize():
     rho_hat[None] /= n_particles[None]
 
 def substep():
-    calculate_CDF1()
-    calculate_CDF2()
+    calculate_CDF()
     P2G()
     apply_BC()
     G2P()
