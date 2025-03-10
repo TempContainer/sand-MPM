@@ -14,9 +14,10 @@ if write_to_disk and not os.path.exists('res'):
 dim = 3
     
 quality = 1
-max_particles = 10000 * quality ** 2
+max_particles = 160000 * quality ** 2
+x_sample = [0.8, 0.2, 0.8] if dim == 3 else [0.2, 0.2]
 n_particles = ti.field(int, ())
-n_grid = 128 * quality
+n_grid = 64 * quality
 padding = 3
 dx, inv_dx = 1 / n_grid, float(n_grid)
 dt = 2e-4 / quality
@@ -42,16 +43,17 @@ grid_f = ti.Vector.field(dim, float, (n_grid,) * dim)
 # mass gradient
 grid_mg = ti.Vector.field(dim, float, (n_grid,) * dim)
 
-p_vol, p_rho = (dx * 0.5) ** 2, 400
-p_mass = p_vol * p_rho
+p_rho = 1000.0
+p_vol = ti.field(float, ())
+p_mass = ti.field(float, ())
 
-E, nu = 3.537e5, 0.3
+E, nu = 1e5, 0.3
 mu_0, lambda_0 = E / (2 * (1 + nu)), E * nu / ((1 + nu) * (1 - 2 * nu))
 h0, h1, h2, h3 = 35, 9, 0.2, 10
 mu_b = 0.75
 
 # mass of the capsule
-m_cpsl = 20
+m_cpsl = 4.0
 r = 0.05
 # position of the capsule
 x_c = ti.Vector.field(dim, float, 3)
@@ -66,7 +68,6 @@ omega_c = ti.Vector.field(dim, float, ())
 J_c = ti.Vector.field(dim, float, ())
 # accumulated torque
 tau_c = ti.Vector.field(dim, float, ())
-
 
 @ti.func
 def log_mat(mat):
@@ -161,8 +162,8 @@ def substep():
         inv_sig = sig.inverse()
         log_sig = log_mat(sig)
         stress = U @ (2 * mu_0 * inv_sig * log_sig + lambda_0 * log_sig.trace() * inv_sig) @ V.transpose()
-        stress = (-p_vol * 4 * inv_dx**2) * stress @ F[p].transpose()
-        affine = p_mass * C[p]
+        stress = (-p_vol[None] * 4 * inv_dx**2) * stress @ F[p].transpose()
+        affine = p_mass[None] * C[p]
         for offset in ti.static(ti.grouped(ti.ndrange(*((3, ) * dim)))):
             dpos = (offset.cast(float) - fx) * dx
             weight = 1.0
@@ -175,14 +176,14 @@ def substep():
                     else:
                         grad_weight[i] *= w[offset[i]][i]
                         
-            grid_v[base + offset] += weight * (p_mass * v[p] + affine @ dpos)
-            grid_m[base + offset] += weight * p_mass
+            grid_v[base + offset] += weight * (p_mass[None] * v[p] + affine @ dpos)
+            grid_m[base + offset] += weight * p_mass[None]
             grid_f[base + offset] += weight * stress @ dpos
-            grid_mg[base + offset] += -p_mass * grad_weight
+            grid_mg[base + offset] += -p_mass[None] * grad_weight
     
     J_c[None] = ti.Vector.zero(float, dim)
     tau_c[None] = ti.Vector.zero(float, dim)
-    v_c[None] += dt * gravity[None]
+    v_c[None] += dt * (gravity[None] + ti.Vector([-20.0, 0, 0]))
     I_c_inv = (R_c[None] @ I_c[None] @ R_c[None].transpose()).inverse()
     
     # boundary conditions
@@ -206,15 +207,20 @@ def substep():
         # collision
         x_i = I.cast(float) * dx
         d = sd_capsule(x_i)
-        if d < 1e-5:
-            x_i_hat = x_i + dt * grid_v[I]
-            d_hat = sd_capsule(x_i_hat) - min(d, 1e-5)
-            n = normal_capsule(x_i_hat).normalized()
-            dv = d_hat * n / dt
-            grid_v[I] -= dv
-            dJ = dv * grid_m[I]
-            J_c[None] += dJ
-            tau_c[None] += (x_i - x_c[0]).cross(dJ)
+        if d < 1e-4:
+            v_ci = v_c[None] + omega_c[None].cross(x_i - x_c[0])
+            n = normal_capsule(x_i).normalized()
+            v_rel = grid_v[I] - v_ci
+            dn = v_rel.dot(n)
+            if dn < 1e-4:
+                v_rn = dn * n
+                v_ri = v_rel - v_rn
+                dv = v_rn + 0.6 * v_ri
+                grid_v[I] -= dv
+                dvv = v_rn
+                dJ = dvv * grid_m[I]
+                J_c[None] += dJ
+                tau_c[None] += (x_i - x_c[0]).cross(dJ)
     
     x_i = x_c[1] if x_c[1][1] < x_c[2][1] else x_c[2]
     x_i[1] -= r
@@ -225,8 +231,8 @@ def substep():
         v_in = v_i.dot(n) * n
         if v_i.dot(n) < 1e-4:
             v_it = v_i - v_in
-            a = max(1 - 0.9 * (1 + 0.5) * v_in.norm() / v_it.norm(), 0.0)
-            v_ii = -0.5 * v_in + a * v_it
+            a = max(1 - 0.9 * (1 + 0.8) * v_in.norm() / v_it.norm(), 0.0)
+            v_ii = -0.2 * v_in + a * v_it
             x_rc = to_mat(x_r)
             K = ti.Matrix.diag(dim, 1.0 / m_cpsl) - x_rc @ I_c_inv @ x_rc
             dJ = K.inverse() @ (v_ii - v_i)
@@ -280,18 +286,28 @@ def substep():
 def initialize():
     if ti.static(dim == 3):
         n_particles[None] = max_particles
+        p_vol[None] = x_sample[0] * x_sample[1] * x_sample[2] / n_particles[None]
     else:
         n_particles[None] = 10000 * quality ** 2
+        p_vol[None] = x_sample[0] * x_sample[1] / n_particles[None]
+    p_mass[None] = p_vol[None] * p_rho
     for i in range(n_particles[None]):
         if ti.static(dim == 3):
-            x[i] = [ti.random() * 0.8 + 0.1, ti.random() * 0.2 + 0.75, ti.random() * 0.8 + 0.1]
+            x[i] = [
+                ti.random() * x_sample[0] + 0.1,
+                ti.random() * x_sample[1] + 0.01,
+                ti.random() * x_sample[2] + 0.1
+            ]
         else:
-            x[i] = [ti.random() * 0.2 + 0.4, ti.random() * 0.2 + 0.5]
+            x[i] = [
+                ti.random() * x_sample[0] + 0.4,
+                ti.random() * x_sample[1] + 0.5
+            ]
         v[i] = ti.Vector.zero(float, dim)
         F[i] = ti.Matrix.identity(float, dim)
         color[i] = ti.Vector([210 / 255, 170 / 255, 109 / 255, 1])
         alpha[i] = 0.067765
-    x_c[1], x_c[2] = [0.5, 0.4, 0.4], [0.5, 0.4, 0.4 + 2 * r]
+    x_c[1], x_c[2] = [2, 0.5, 0.4], [2, 0.5, 0.6 + 2 * r]
     x_c[0] = (x_c[1] + x_c[2]) * 0.5
     q_c[None] = ti.Vector([1, 0, 0, 0])
     R_c[None] = ti.Matrix.identity(float, dim)
@@ -314,8 +330,8 @@ def initialize():
                         grad_weight[i] *= grad_w[offset[i]][i]
                     else:
                         grad_weight[i] *= w[offset[i]][i]
-            grid_m[base + offset] += weight * p_mass
-            grid_mg[base + offset] += -p_mass * grad_weight
+            grid_m[base + offset] += weight * p_mass[None]
+            grid_mg[base + offset] += -p_mass[None] * grad_weight
     for p in range(n_particles[None]):
         base = (x[p] * inv_dx - 0.5).cast(int)
         fx = x[p] * inv_dx - base.cast(float)
@@ -353,7 +369,7 @@ def main():
             scene.point_light(pos=(0.5, 1.5, 1.5), color=(1, 1, 1))
             canvas.scene(scene)
             
-        for frame in range(1200 + 120):
+        for frame in range(1000):
             for _ in range(50):
                 substep()
             render()
